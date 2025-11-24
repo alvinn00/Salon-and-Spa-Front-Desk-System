@@ -841,7 +841,7 @@ def confirm_delete(username):
     
     response = messagebox.askyesno("Confirm Deletion", 
                                    f"Are you sure you want to permanently delete the Staff account for {username}?\n\n"
-                                   f"⚠️ WARNING: This will also update all their pending reservations to 'Pending - Staff Unavailable'.")
+                                   f"WARNING: This will also update all their pending reservations to 'Pending - Staff Unavailable'.")
     
     if not response:
         return
@@ -1087,7 +1087,7 @@ def admin_menu():
                 if specialty_or_category == "N/A":
                     specialty_or_category = d.get("service", "N/A")
 
-                tk.Label(scroll_frame, text=f"👤 {u} | Role: {d['role']} | Specialty: {specialty_or_category}",
+                tk.Label(scroll_frame, text=f"{u} | Role: {d['role']} | Specialty: {specialty_or_category}",
                          font=("Arial", 12), fg="black", bg="white").pack(anchor="w", padx=20, pady=5)
         else:
             tk.Label(scroll_frame, text="No users available.", font=("Arial", 12),
@@ -1180,7 +1180,7 @@ def admin_menu():
                 except:
                     time_display = r.get('time', 'N/A')
                     
-                tk.Label(scroll_frame, text=f"👤 {r['customer']} | 💅 Service: {r['service']} | Staff: {r['staff']} | 🗓 {r.get('date', 'N/A')} @ {time_display} | Status: {r['status']}",
+                tk.Label(scroll_frame, text=f"{r['customer']} | Service: {r['service']} | Staff: {r['staff']} | 🗓 {r.get('date', 'N/A')} @ {time_display} | Status: {r['status']}",
                          font=("Arial", 12), fg="black", bg="white").pack(anchor="w", padx=20, pady=5)
         else:
             tk.Label(scroll_frame, text="No reservations yet.", font=("Arial", 12), fg="gray", bg="white").pack(pady=20)
@@ -1215,14 +1215,14 @@ def admin_menu():
 
         if staff_schedules:
             for staff_name, schedules in staff_schedules.items():
-                tk.Label(scroll_frame, text=f"👤 STAFF: {staff_name}",
+                tk.Label(scroll_frame, text=f" STAFF: {staff_name}",
                          font=("Arial Rounded MT Bold", 14),
                          fg="pink", bg="white").pack(anchor="w", padx=10, pady=10)
 
                 if schedules:
                     for s in schedules:
                         tk.Label(scroll_frame,
-                                 text=f"   🗓 {s['date']} | {s['start']} - {s['end']}",
+                                 text=f"    {s['date']} | {s['start']} - {s['end']}",
                                  font=("Arial", 12),
                                  fg="black", bg="white").pack(anchor="w", padx=30, pady=3)
                 else:
@@ -1251,7 +1251,7 @@ def admin_menu():
         report_frame.pack(pady=10)
 
         total_customers = len([u for u in users.values() if u.get("role") == "Customer"])
-        tk.Label(report_frame, text=f"👥 Total Customers: {total_customers}", font=("Arial", 14), bg="white").pack(anchor="w")
+        tk.Label(report_frame, text=f" Total Customers: {total_customers}", font=("Arial", 14), bg="white").pack(anchor="w")
 
         total_reservations = len(reservations)
         tk.Label(report_frame, text=f"Total Reservations: {total_reservations}", font=("Arial", 14), bg="white").pack(anchor="w")
@@ -1267,7 +1267,7 @@ def admin_menu():
 
             if service_count:
                 most_popular = max(service_count, key=service_count.get)
-                tk.Label(report_frame, text=f"🔥 Most Popular Service: {most_popular}", font=("Arial", 14), bg="white").pack(anchor="w", pady=10)
+                tk.Label(report_frame, text=f" Most Popular Service: {most_popular}", font=("Arial", 14), bg="white").pack(anchor="w", pady=10)
             else:
                  tk.Label(report_frame, text="No service data yet.", font=("Arial", 12), fg="gray", bg="white").pack(anchor="w", pady=10)
 
@@ -1313,7 +1313,7 @@ def admin_menu():
                      fg="gray", bg="white").pack(pady=10)
         else:
             for staff_name in staff_names:
-                tk.Label(scroll_frame, text=f"👤 {staff_name}", font=("Arial Rounded MT Bold", 16),
+                tk.Label(scroll_frame, text=f" {staff_name}", font=("Arial Rounded MT Bold", 16),
                          fg="pink", bg="white").pack(anchor="w", padx=10, pady=10)
 
                 staff_ratings = [r for r in reservations if r.get("staff") == staff_name and "rating" in r]
@@ -1325,7 +1325,7 @@ def admin_menu():
                     for r in staff_ratings:
                         comment_text = r.get("comment", "No comment")
                         tk.Label(scroll_frame,
-                                 text=f"   ⭐ {r['rating']} | Customer: {r['customer']} | Service: {r['service']}\n     Comment: {comment_text}",
+                                 text=f" {r['rating']} | Customer: {r['customer']} | Service: {r['service']}\n     Comment: {comment_text}",
                                  font=("Arial", 12), fg="black", bg="white", justify="left").pack(anchor="w", padx=30, pady=5)
 
         tk.Button(root, text="Back", bg="gray", fg="white", font=("Arial", 12, "bold"),
@@ -1884,7 +1884,7 @@ def view_services(username):
     scrollbar.pack(side="right", fill="y")
 
     for category, items in services.items():
-        tk.Label(scroll_frame, text=f"🌸 {category}",
+        tk.Label(scroll_frame, text=f" {category}",
                  font=("Arial Rounded MT Bold", 16),
                  fg="#ff69b4", bg="white").pack(anchor="w", pady=(5, 0))
 
@@ -2653,5 +2653,6 @@ def view_reservations_customer(username):
 
 main_menu()
 root.mainloop()
+
 
 

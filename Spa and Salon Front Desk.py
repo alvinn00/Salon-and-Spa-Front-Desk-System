@@ -38,8 +38,7 @@ def get_users_from_db():
             return {}
 
         cursor = conn.cursor(dictionary=True)
-        
-        cursor.execute("SELECT username, password, role, category, specialty FROM users")
+        cursor.execute("SELECT username, password, role, name, email, phone, category, specialty FROM users")
         result = cursor.fetchall()
         conn.close()
 
@@ -48,6 +47,9 @@ def get_users_from_db():
             users_dict[row["username"]] = {
                 "password": row["password"],
                 "role": row["role"],
+                "name": row.get("name"),
+                "email": row.get("email"),
+                "contact": row.get("phone"),   
                 "category": row.get("category"),
                 "specialty": row.get("specialty")
             }
@@ -58,41 +60,167 @@ def get_users_from_db():
         return {}
 
 
+def get_available_rooms():
+    try:
+        conn = create_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT room_name FROM rooms WHERE status='available'")
+        rooms = [r['room_name'] for r in cursor.fetchall()]
+        conn.close()
+        return rooms
+    except Exception as e:
+        print("Error fetching rooms:", e)
+        return []
 
-def insert_reservation_to_db(customer, staff, service, date, time, duration):
+def mark_room_occupied(room_name):
     try:
         conn = create_connection()
         cursor = conn.cursor()
+        cursor.execute("UPDATE rooms SET status='occupied' WHERE room_name=%s", (room_name,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print("Error updating room status:", e)
+
+def mark_room_available(room_name):
+    try:
+        conn = create_connection()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE rooms SET status='available' WHERE room_name=%s", (room_name,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print("Error releasing room:", e)
+
+def auto_release_room(room_name, date, start_time, duration_minutes):
+    import datetime, time
+   
+    end_datetime = datetime.datetime.combine(date, start_time) + datetime.timedelta(minutes=duration_minutes)
+    now = datetime.datetime.now()
+    delay = (end_datetime - now).total_seconds()
+    if delay > 0:
+        time.sleep(delay)
+    mark_room_available(room_name)
+    print(f"Room {room_name} is now available again.")
+
+def reserve_service_with_room(customer, staff, service, date, time_obj, duration_minutes, room_name):
+    
+    available_rooms = get_available_rooms()
+    if room_name not in available_rooms:
+        print(f"Room {room_name} is already occupied!")
+        return False
+
+   
+    success = insert_reservation_to_db(customer, staff, service, date, time_obj, duration_minutes)
+    if success:
+
+        mark_room_occupied(room_name)
+       
+        import threading
+        threading.Thread(target=auto_release_room, args=(room_name, date, time_obj, duration_minutes), daemon=True).start()
+        print(f"Reservation confirmed! Room {room_name} now occupied.")
+        return True
+    return False
+
+
+def insert_reservation_to_db(customer, staff, service, date, time_obj, duration, room_name=None):
+    """
+    Insert reservation into `reservations` and optionally into `reservation_rooms` (with room_name).
+    Returns True on success, False on failure.
+    - customer, staff are username strings.
+    - date: datetime.date
+    - time_obj: datetime.time
+    - duration: int (minutes)
+    - room_name: string or None
+    """
+    try:
+        conn = create_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        date_str = date.strftime("%Y-%m-%d")
+        time_str = time_obj.strftime("%H:%M:%S")
+        start_dt = datetime.datetime.combine(date, time_obj)
+        end_dt = start_dt + datetime.timedelta(minutes=duration)
+        start_dt_str = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+        end_dt_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
 
         cursor.execute("""
-            SELECT * FROM reservations
-            WHERE staff_name = %s AND date = %s
-              AND TIME_TO_SEC(time) <= TIME_TO_SEC(%s) + (%s * 60)
-              AND TIME_TO_SEC(time) + (duration_minutes * 60) >= TIME_TO_SEC(%s)
+            SELECT date, time, duration_minutes
+            FROM reservations
+            WHERE customer_name = %s
               AND status NOT IN ('Cancelled','Completed','No-Show (Cancelled)')
-        """, (staff, date.strftime("%Y-%m-%d"), time.strftime("%H:%M:%S"), duration, time.strftime("%H:%M:%S")))
-        conflict = cursor.fetchone()
-        if conflict:
-            conn.close()
-            return False
-
-        parts = service.split(" - ")
-        service_name_only = parts[1] if len(parts) >= 2 else service
+              AND date = %s
+        """, (customer, date_str))
+        rows = cursor.fetchall()
+        for r in rows:
+            r_time = r['time']
+            if isinstance(r_time, datetime.timedelta):
+                r_time = (datetime.datetime.min + r_time).time()
+            existing_start = datetime.datetime.combine(r['date'], r_time)
+            existing_end = existing_start + datetime.timedelta(minutes=r['duration_minutes'])
+            if (start_dt < existing_end) and (end_dt > existing_start):
+                print("DEBUG: customer conflict with", r)
+                conn.close()
+                return False
 
         cursor.execute("""
-            INSERT INTO reservations (customer_name, staff_name, service_name, date, time, duration_minutes, status)
-            VALUES (%s,%s,%s,%s,%s,%s,'Pending')
-        """, (customer, staff, service_name_only,
-              date.strftime("%Y-%m-%d"),
-              time.strftime("%H:%M:%S"),
-              duration))
+            SELECT date, time, duration_minutes
+            FROM reservations
+            WHERE staff_name = %s
+              AND status NOT IN ('Cancelled','Completed','No-Show (Cancelled)')
+              AND date = %s
+        """, (staff, date_str))
+        rows = cursor.fetchall()
+        for r in rows:
+            r_time = r['time']
+            if isinstance(r_time, datetime.timedelta):
+                r_time = (datetime.datetime.min + r_time).time()
+            existing_start = datetime.datetime.combine(r['date'], r_time)
+            existing_end = existing_start + datetime.timedelta(minutes=r['duration_minutes'])
+            if (start_dt < existing_end) and (end_dt > existing_start):
+                print("DEBUG: staff conflict with", r)
+                conn.close()
+                return False
+
+        if room_name:
+            cursor.execute("""
+                SELECT *
+                FROM reservation_rooms
+                WHERE room_name = %s
+                  AND NOT (end_time <= %s OR start_time >= %s)
+            """, (room_name, start_dt_str, end_dt_str))
+            conflict = cursor.fetchone()
+            if conflict:
+                print("DEBUG: room conflict with", conflict)
+                conn.close()
+                return False
+
+        cursor.execute("""
+            INSERT INTO reservations
+             (customer_name, staff_name, service_name, date, time, duration_minutes, status)
+            VALUES (%s, %s, %s, %s, %s, %s, 'Pending')
+        """, (customer, staff, service, date_str, time_str, duration))
+        reservation_id = cursor.lastrowid
+
+        if room_name:
+            cursor.execute("""
+                INSERT INTO reservation_rooms
+                (reservation_id, room_name, staff_name, start_time, end_time, customer_name)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (reservation_id, room_name, staff, start_dt_str, end_dt_str, customer))
+          
 
         conn.commit()
         conn.close()
-        return True       
+        print("DEBUG: reservation inserted id=", reservation_id)
+        return True
 
     except Exception as e:
         print("DB ERROR:", e)
+        try:
+            conn.close()
+        except Exception:
+            pass
         return False
 
 
@@ -146,14 +274,32 @@ def get_staff_schedules_from_db():
 def update_reservation_status_db(reservation_id, new_status):
     try:
         conn = create_connection()
-        cursor = conn.cursor()
+        cursor = conn.cursor(dictionary=True)
+
         sql = "UPDATE reservations SET status = %s WHERE id = %s"
         cursor.execute(sql, (new_status, reservation_id))
+
+        cursor.execute("SELECT room_name FROM reservation_rooms WHERE reservation_id = %s", (reservation_id,))
+        room = cursor.fetchone()
+        if room:
+            room_name = room.get("room_name")
+
+            if new_status == "On-Going":
+                cursor.execute("UPDATE rooms SET status='occupied' WHERE room_name=%s", (room_name,))
+            elif new_status in ["Completed", "Cancelled", "No-Show (Cancelled)"]:
+                cursor.execute("UPDATE rooms SET status='available' WHERE room_name=%s", (room_name,))
+            else:
+                pass
+
         conn.commit()
         conn.close()
         print(f"Reservation {reservation_id} status updated to {new_status}")
     except Exception as e:
         print("Error updating reservation:", e)
+        try:
+            conn.close()
+        except:
+            pass
 
 
 def create_user(username, password, role="Customer", name=None, category=None, specialty=None, email=None, phone=None):
@@ -163,7 +309,6 @@ def create_user(username, password, role="Customer", name=None, category=None, s
             return False
 
         cursor = conn.cursor()
-        
         sql = """
         INSERT INTO users (username, password, role, name, category, specialty, email, phone)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
@@ -369,7 +514,7 @@ def update_staff_and_price(event):
     available_staff = []
     for u, d in users.items():
         if d.get("role") == "Staff":
-            
+
             staff_specialties = d.get("specialty") or ""
             staff_specialties_list = [s.strip() for s in staff_specialties.split(",")] if staff_specialties else []
 
@@ -393,7 +538,7 @@ def update_reservation_status(new_status, is_completion=False):
     res = reservations[true_index]
 
     res_id = res.get("id")
-    res_date = res.get("date")  
+    res_date = res.get("date")   
     if not res_id:
         messagebox.showerror("Error", "Reservation ID not found!")
         return
@@ -447,7 +592,7 @@ def get_reservations_from_db():
                 "duration": row["duration_minutes"],
                 "status": row["status"],
                 "payment_method": row["payment_method"],
-                "rating": row["rating"],     
+                "rating": row["rating"],    
                 "comment": row["comment"]   
             })
 
@@ -473,6 +618,30 @@ def update_reservation_rating_db(res_id, rating, comment):
     except Exception as e:
         print("Error updating rating:", e)
         return False
+
+
+def reload_services_from_db():
+    global services
+    services = {}
+    try:
+        conn = create_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT staff_id, category, service_name, price, duration_minutes, description FROM staff_specialties")
+        rows = cursor.fetchall()
+        conn.close()
+
+        for row in rows:
+            cat = row["category"]
+            svc = row["service_name"]
+            if cat not in services:
+                services[cat] = {}
+            services[cat][svc] = {
+                "price": row["price"],
+                "duration": row["duration_minutes"],
+                "description": row["description"]
+            }
+    except Exception as e:
+        print("Error loading services:", e)
 
 
 
@@ -739,10 +908,10 @@ def login_screen(role):
         else:
             messagebox.showerror("Error", "Invalid username or password.")
 
-    login_btn = tk.Button(canvas, text="Login", font=("Arial", 18, "bold"), bg="pink", fg="black", width=12, command=do_login)
+    login_btn = tk.Button(canvas, text="Login", font=("Arial", 18, "bold"), bg="blue", fg="black", width=12, command=do_login)
     canvas.create_window(400, 430, window=login_btn)
 
-    back_btn = tk.Button(canvas, text="Back", font=("Arial", 18, "bold"), bg="pink", fg="black", width=12, command=main_menu)
+    back_btn = tk.Button(canvas, text="Back", font=("Arial", 18, "bold"), bg="blue", fg="black", width=12, command=main_menu)
     canvas.create_window(400, 490, window=back_btn)
 
 
@@ -825,8 +994,8 @@ def register_screen():
             specialty_combo.pack_forget()
 
     role_combo.bind("<<ComboboxSelected>>", on_role_change)
-    
 
+   
     def create_account():
         username = username_entry.get().strip()
         password = password_entry.get().strip()
@@ -907,7 +1076,6 @@ def register_screen():
             main_menu()
             return
 
-    
         if role == "Admin":
             success = create_user(
                 username=username,
@@ -928,49 +1096,70 @@ def register_screen():
             return
 
     tk.Button(main_frame, text="Register", font=("Arial", 14, "bold"),
-              bg="pink", fg="black", width=12,
+              bg="blue", fg="black", width=12,
               command=create_account).pack(pady=10)
 
     tk.Button(main_frame, text="Back", font=("Arial", 14, "bold"),
-              bg="pink", fg="black", width=12,
+              bg="blue", fg="black", width=12,
               command=main_menu).pack(pady=5)
     
 
 def validate_numeric(P):
-    
+
     return P.isdigit() or P == ""
 vcmd_numeric = root.register(validate_numeric)
 
 def confirm_delete(username):
     global users, reservations, staff_schedules
     
-    response = messagebox.askyesno("Confirm Deletion", 
-                                   f"Are you sure you want to permanently delete the Staff account for {username}?\n\n"
-                                   f" WARNING: This will also update all their pending reservations to 'Pending - Staff Unavailable'.")
-    
-    if not response:
+    if not messagebox.askyesno(
+        "Confirm Deletion", 
+        f"Are you sure you want to permanently delete the Staff account for {username}?\n\n"
+        f" WARNING: This will also update all their pending reservations to 'Pending - Staff Unavailable'."
+    ):
         return
 
     pending_count = 0
-    
     for res in reservations:
         if res.get("staff") == username:
             if res.get("status") in ("Pending", "Confirmed", "Awaiting Payment"):
                 res["status"] = "Pending - Staff Unavailable"
-                res["staff"] = "Unassigned" 
+                res["staff"] = "Unassigned"
                 pending_count += 1
+
+    try:
+        conn = create_connection()
+        if not conn:
+            messagebox.showerror("Error", "Database connection failed.")
+            return
+
+        cursor = conn.cursor()
+
+        cursor.execute("DELETE FROM staff_specialties WHERE staff_id = %s", (username,))
+
+        cursor.execute("DELETE FROM staff_schedules WHERE staff_name = %s", (username,))
+
+        cursor.execute("DELETE FROM users WHERE username = %s AND role = 'Staff'", (username,))
+
+        conn.commit()
+        conn.close()
+
+    except Exception as e:
+        messagebox.showerror("Error", f"Failed to delete staff: {e}")
+        return
 
     if username in users:
         del users[username]
-        
     if username in staff_schedules:
         del staff_schedules[username]
-        
-    messagebox.showinfo("Success", 
-                        f"Staff account for {username} has been deleted.\n"
-                        f"Total {pending_count} pending reservations were updated.")
-    
-    manage_registration() 
+
+    messagebox.showinfo(
+        "Success", 
+        f"Staff account for {username} has been deleted.\n"
+        f"Total {pending_count} pending reservations were updated."
+    )
+    manage_registration()
+
 
 def delete_user_form(role):
     if role != "Staff":
@@ -981,31 +1170,30 @@ def delete_user_form(role):
     tk.Label(root, text="DELETE STAFF ACCOUNT", font=("Arial Rounded MT Bold", 26), fg="red", bg="white").pack(pady=20)
 
     staff_list = [u for u, d in users.items() if d.get("role") == "Staff"]
-    
+
     if not staff_list:
         tk.Label(root, text="No Staff accounts found.", font=("Arial", 16), bg="white").pack(pady=10)
         tk.Button(root, text="Back", font=("Arial", 16), command=manage_registration).pack(pady=20)
         return
 
     tk.Label(root, text="Select Staff to Delete:", font=("Arial", 16, "bold"), bg="white").pack(pady=10)
-    
+
     staff_box = ttk.Combobox(root, values=staff_list, font=("Arial", 14), width=30, state="readonly")
     staff_box.pack(pady=5)
-    
+
     if staff_list:
-        staff_box.set(staff_list[0]) 
+        staff_box.set(staff_list[0])
 
     def delete_selected():
         selected_staff = staff_box.get()
         if not selected_staff:
             messagebox.showerror("Error", "Please select a staff member to delete.")
             return
-
         confirm_delete(selected_staff)
-        
+
     tk.Button(root, text="Delete Selected Staff", font=("Arial", 16, "bold"),
               bg="red", fg="white", width=25, command=delete_selected).pack(pady=20)
-              
+
     tk.Button(root, text="Cancel", font=("Arial", 16),
               bg="gray", fg="white", width=25, command=manage_registration).pack(pady=10)
 
@@ -1155,7 +1343,6 @@ def admin_menu():
 
     btn = {"bg": "pink", "fg": "black", "font": ("Arial", 16, "bold"),
            "width": 25, "height": 1, "bd": 0}
-    
 
     def view_users_panel():
         clear_frame()
@@ -1186,7 +1373,7 @@ def admin_menu():
 
         if users:
             for u, d in users.items():
-               
+
                 specialty_or_category = d.get("category", "N/A")
                 
                 if specialty_or_category == "N/A":
@@ -1202,64 +1389,6 @@ def admin_menu():
                   bg="pink", fg="black", font=("Arial", 14, "bold")).pack(pady=10)
 
     
-    def change_staff_role_panel():
-        clear_frame()
-        tk.Label(root, text="CHANGE STAFF ROLE",
-                 font=("Arial Rounded MT Bold", 22),
-                 fg="pink", bg="white").pack(pady=20)
-
-        staff_list = [u for u, d in users.items() if d.get("role") == "Staff"]
-
-        if not staff_list:
-            tk.Label(root, text="No staff available.", font=("Arial", 14), fg="gray", bg="white").pack()
-            tk.Button(root, text="Back", command=admin_menu, bg="gray", fg="white").pack(pady=5)
-            return
-
-        tk.Label(root, text="Select Staff:", font=("Arial", 14), bg="white").pack()
-        staff_combo = ttk.Combobox(root, values=staff_list, font=("Arial", 12), state="readonly")
-        staff_combo.pack(pady=10)
-
-        tk.Label(root, text="Select New Specialty Category:", font=("Arial", 14), bg="white").pack() 
-
-        roles = list(services.keys()) 
-
-        role_combo = ttk.Combobox(root, values=roles, font=("Arial", 12), state="readonly")
-        role_combo.pack(pady=10)
-
-        def apply_change():
-            staff = staff_combo.get()
-            new_category = role_combo.get()
-
-            if not staff or not new_category:
-                messagebox.showerror("Error", "Please select both staff and category.")
-                return
-            
-            if staff in users:
-                users[staff]["category"] = new_category 
-
-                new_services_data = services.get(new_category, {})
-                
-                staff_specialty = {}
-                for service_name, details in new_services_data.items():
-                    staff_specialty[service_name] = {
-                        "price": details.get("price", 0),
-                        "description": details.get("description", ""),
-                        "duration": details.get("duration", 60) 
-                    }
-                
-                users[staff]["specialty"] = staff_specialty
-
-                messagebox.showinfo("Success", f"{staff}'s Specialty Category and Assigned Services are now: {new_category}")
-            else:
-                messagebox.showerror("Error", "Staff user not found.")
-
-
-        tk.Button(root, text="Apply Change", command=apply_change,
-                  bg="pink", fg="black", font=("Arial", 14, "bold")).pack(pady=10)
-
-        tk.Button(root, text="Back", command=admin_menu,
-                  bg="gray", fg="white", font=("Arial", 12, "bold")).pack(pady=10)
-
    
     def view_reservations_panel():
         clear_frame()
@@ -1277,29 +1406,36 @@ def admin_menu():
         canvas.pack(side="left", fill="both", expand=True, padx=20, pady=10)
         v_scrollbar.pack(side="right", fill="y")
 
+        try:
+            conn = create_connection()
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute("SELECT * FROM reservations ORDER BY date, time")
+            reservations = cursor.fetchall()
+            conn.close()
+        except Exception as e:
+            print("Error loading reservations:", e)
+            reservations = []    
+            
         if reservations:
             for r in reservations:
-                
                 try:
-                    time_display = datetime.strptime(r['time'], "%H:%M").strftime("%I:%M %p").lstrip('0')
+                    if isinstance(r['time'], datetime.timedelta):
+                        res_time = (datetime.datetime.min + r['time']).time()
+                        time_display = res_time.strftime("%I:%M %p").lstrip('0')
+                    else:
+                        time_display = datetime.datetime.strptime(str(r['time']), "%H:%M:%S").strftime("%I:%M %p").lstrip('0')
                 except:
                     time_display = r.get('time', 'N/A')
-                    
-                tk.Label(scroll_frame, text=f"{r['customer']} | Service: {r['service']} | Staff: {r['staff']} | {r.get('date', 'N/A')} @ {time_display} | Status: {r['status']}",
-                         font=("Arial", 12), fg="black", bg="white").pack(anchor="w", padx=20, pady=5)
+
+                tk.Label(scroll_frame,
+                         text=f" {r['customer_name']} | Service: {r['service_name']} | Staff: {r['staff_name']} | 🗓 {r['date']} @ {time_display} | Status: {r['status']}",     
+                         font=("Arial", 12), fg="green", bg="white").pack(anchor="w", padx=20, pady=5)
         else:
             tk.Label(scroll_frame, text="No reservations yet.", font=("Arial", 12), fg="gray", bg="white").pack(pady=20)
-
+              
         tk.Button(root, text="Back", command=admin_menu,
-                  bg="pink", fg="black", font=("Arial", 14, "bold")).pack(pady=10)
-
-   
-    def manage_services_panel():
-        clear_frame()
-        tk.Label(root, text="MANAGE SERVICES", font=("Arial Rounded MT Bold", 20),
-                 fg="pink", bg="white").pack(pady=10)
-        tk.Label(root, text="Feature coming soon...", font=("Arial", 14), bg="white").pack(pady=50)
-        tk.Button(root, text="Back", command=admin_menu, bg="gray", fg="white").pack(pady=5)
+                  bg="blue", fg="black", font=("Arial", 14, "bold")).pack(pady=10)
+    
 
     def staff_schedule_panel():
         clear_frame()
@@ -1321,29 +1457,29 @@ def admin_menu():
             for staff_name, schedules in staff_schedules.items():
                 tk.Label(scroll_frame, text=f"👤 STAFF: {staff_name}",
                          font=("Arial Rounded MT Bold", 14),
-                         fg="pink", bg="white").pack(anchor="w", padx=10, pady=10)
+                         fg="black", bg="white").pack(anchor="w", padx=10, pady=10)
 
                 if schedules:
                     for s in schedules:
                         tk.Label(scroll_frame,
-                                 text=f"   🗓 {s['date']} | {s['start']} - {s['end']}",
+                                 text=f" {s['date']} | {s['start']} - {s['end']}",
                                  font=("Arial", 12),
                                  fg="black", bg="white").pack(anchor="w", padx=30, pady=3)
                 else:
                     tk.Label(scroll_frame,
-                             text="   No schedules yet.",
+                             text="No schedules yet.",
                              font=("Arial", 12),
-                             fg="gray", bg="white").pack(anchor="w", padx=30, pady=3)
+                             fg="black", bg="white").pack(anchor="w", padx=30, pady=3)
         else:
             tk.Label(scroll_frame,
                      text="No staff schedules found.",
                      font=("Arial", 14),
-                     fg="gray", bg="white").pack(anchor="w", padx=10, pady=10)
+                     fg="black", bg="white").pack(anchor="w", padx=10, pady=10)
 
 
         tk.Button(root, text="Back", command=admin_menu,
-                  bg="gray", fg="white").pack(pady=5)
-        
+                  bg="blue", fg="black").pack(pady=5)
+
 
     def reports_panel():
         clear_frame()
@@ -1354,31 +1490,43 @@ def admin_menu():
         report_frame = tk.Frame(root, bg="white")
         report_frame.pack(pady=10)
 
+        try:
+           conn = create_connection()
+           cursor = conn.cursor(dictionary=True)
+           cursor.execute("SELECT * FROM reservations")
+           reservations = cursor.fetchall()
+           conn.close()
+        except Exception as e:
+            print("Error loading reservations:", e)
+            reservations = []   
+
         total_customers = len([u for u in users.values() if u.get("role") == "Customer"])
-        tk.Label(report_frame, text=f"👥 Total Customers: {total_customers}", font=("Arial", 14), bg="white").pack(anchor="w")
-
+        tk.Label(report_frame, text=f" Total Customers: {total_customers}", font=("Arial", 14), bg="white").pack(anchor="w")
+        
         total_reservations = len(reservations)
-        tk.Label(report_frame, text=f"Total Reservations: {total_reservations}", font=("Arial", 14), bg="white").pack(anchor="w")
-
+        tk.Label(report_frame, text=f" Total Reservations: {total_reservations}", font=("Arial", 14), bg="white").pack(anchor="w")
+        
         completed_reservations = len([r for r in reservations if r.get("status") == "Completed"])
-        tk.Label(report_frame, text=f"Completed Reservations: {completed_reservations}", font=("Arial", 14), bg="white").pack(anchor="w")
+        tk.Label(report_frame, text=f" Completed Reservations: {completed_reservations}", font=("Arial", 14), bg="white").pack(anchor="w")
 
         if reservations:
             service_count = {}
             for r in reservations:
-                service_name = r.get("service")
-                service_count[service_name] = service_count.get(service_name, 0) + 1
+                service_name = r.get("service_name")
+                if service_name:
+                    service_count[service_name] = service_count.get(service_name, 0) + 1
 
             if service_count:
                 most_popular = max(service_count, key=service_count.get)
-                tk.Label(report_frame, text=f"🔥 Most Popular Service: {most_popular}", font=("Arial", 14), bg="white").pack(anchor="w", pady=10)
+                tk.Label(report_frame, text=f" Most Popular Service: {most_popular}", font=("Arial", 14), bg="white").pack(anchor="w", pady=10)
             else:
                  tk.Label(report_frame, text="No service data yet.", font=("Arial", 12), fg="gray", bg="white").pack(anchor="w", pady=10)
 
             staff_count = {}
             for r in reservations:
-                staff_name = r.get("staff")
-                staff_count[staff_name] = staff_count.get(staff_name, 0) + 1
+                staff_name = r.get("staff_name")
+                if staff_name:
+                    staff_count[staff_name] = staff_count.get(staff_name, 0) + 1
 
             if staff_count:
                 most_active_staff = max(staff_count, key=staff_count.get)
@@ -1391,7 +1539,7 @@ def admin_menu():
 
 
         tk.Button(root, text="Back", command=admin_menu,
-                  bg="gray", fg="white", font=("Arial", 12, "bold")).pack(pady=20)
+                  bg="blue", fg="black", font=("Arial", 12, "bold")).pack(pady=20)
 
    
     def view_staff_ratings_panel():
@@ -1410,7 +1558,17 @@ def admin_menu():
         canvas.pack(side="left", fill="both", expand=True, padx=20, pady=10)
         v_scrollbar.pack(side="right", fill="y")
 
-        staff_names = list({r["staff"] for r in reservations if "staff" in r})
+        try:
+           conn = create_connection()
+           cursor = conn.cursor(dictionary=True)
+           cursor.execute("SELECT * FROM reservations")
+           reservations = cursor.fetchall()
+           conn.close()
+        except Exception as e:
+            print("Error loading reservations:", e)
+            reservations = []
+
+        staff_names = list({r["staff_name"] for r in reservations if r.get("staff_name")})
 
         if not staff_names:
             tk.Label(scroll_frame, text="No staff found in reservations.", font=("Arial", 14),
@@ -1420,8 +1578,8 @@ def admin_menu():
                 tk.Label(scroll_frame, text=f"👤 {staff_name}", font=("Arial Rounded MT Bold", 16),
                          fg="pink", bg="white").pack(anchor="w", padx=10, pady=10)
 
-                staff_ratings = [r for r in reservations if r.get("staff") == staff_name and "rating" in r]
-
+                staff_ratings = [r for r in reservations if r.get("staff_name") == staff_name and r.get("rating")]
+                
                 if not staff_ratings:
                     tk.Label(scroll_frame, text="   No ratings yet.", font=("Arial", 12),
                              fg="gray", bg="white").pack(anchor="w", padx=30, pady=5)
@@ -1429,20 +1587,17 @@ def admin_menu():
                     for r in staff_ratings:
                         comment_text = r.get("comment", "No comment")
                         tk.Label(scroll_frame,
-                                 text=f"   ⭐ {r['rating']} | Customer: {r['customer']} | Service: {r['service']}\n     Comment: {comment_text}",
+                                 text=f"⭐ {r['rating']} | Customer: {r['customer_name']} | Service: {r['service_name']}\n  Comment: {comment_text}",                                 
                                  font=("Arial", 12), fg="black", bg="white", justify="left").pack(anchor="w", padx=30, pady=5)
 
-        tk.Button(root, text="Back", bg="gray", fg="white", font=("Arial", 12, "bold"),
+        tk.Button(root, text="Back", bg="blue", fg="black", font=("Arial", 12, "bold"),
                   command=admin_menu).pack(pady=20)
 
-  
+   
     tk.Button(root, text="View All Users", command=view_users_panel, **btn).pack(pady=5)
     
     tk.Button(root, text="Manage Registrations (Users)", command=manage_registration, **btn).pack(pady=5)
-    
-    tk.Button(root, text="Change Staff Role", command=change_staff_role_panel, **btn).pack(pady=5)
     tk.Button(root, text="View All Reservations", command=view_reservations_panel, **btn).pack(pady=5)
-    tk.Button(root, text="Manage Services", command=manage_services_panel, **btn).pack(pady=5)
     tk.Button(root, text="Staff Schedule", command=staff_schedule_panel, **btn).pack(pady=5)
     tk.Button(root, text="Reports & Analytics", command=reports_panel, **btn).pack(pady=5)
     tk.Button(root, text="View Staff Ratings", command=view_staff_ratings_panel, **btn).pack(pady=5)
@@ -1504,7 +1659,7 @@ def view_staff_profile(username):
         service_tree.pack(fill="x", expand=True)
 
     tk.Button(root, text="Back", command=lambda: staff_menu(username), 
-              bg="pink", fg="black", font=("Arial", 16, "bold")).pack(pady=30)
+              bg="blue", fg="black", font=("Arial", 16, "bold")).pack(pady=30)
 
 
 
@@ -1517,7 +1672,6 @@ def staff_menu(username):
     btn_style = {"bg": "pink", "fg": "black",
                  "font": ("Arial", 16, "bold"),
                  "width": 25, "height": 1, "bd": 0}
-    
 
     def view_assigned():
         load_data_from_db()
@@ -1563,9 +1717,8 @@ def staff_menu(username):
                           bg="white", fg="black", anchor="w", justify="left").pack(fill="x", padx=5, pady=2)
         
         tk.Button(root, text="Back", font=("Arial", 16, "bold"),
-                  bg="pink", fg="black", width=10,
+                  bg="blue", fg="black", width=10,
                   command=lambda: staff_menu(username)).pack(pady=10)
-        
 
     def open_update_gui():
         global own, own_indices, listbox, update_win
@@ -1600,15 +1753,14 @@ def staff_menu(username):
         listbox.pack(side=tk.LEFT, fill=tk.BOTH)
 
         for i, r in enumerate(own):
-            customer = r.get("customer", "Unknown")  
-            service  = r.get("service", "Unknown")    
+            customer = r.get("customer", "Unknown")   
+            service  = r.get("service", "Unknown")  
             date     = r.get("date", "N/A")
             status   = r.get("status", "Pending")
             listbox.insert(tk.END, f"{i+1}. {customer} | {service} | {date} | STATUS: {status}")
 
         alert_label = tk.Label(update_win, text="", font=("Arial", 12, "italic"), bg="white", fg="red")
         alert_label.pack(pady=5)
-        
 
         def update_reservation_status(new_status, is_completion=False):
             sel = listbox.curselection()
@@ -1686,7 +1838,7 @@ def staff_menu(username):
                                 font=("Arial", 14, "bold"), bg="skyblue", fg="black", width=12)
         btn_ongoing.grid(row=0, column=3, padx=5, pady=5)
 
-        listbox.bind("<<ListboxSelect>>", lambda e: None)  
+        listbox.bind("<<ListboxSelect>>", lambda e: None) 
 
     def staff_view_ratings_panel(root, username):
         load_data_from_db() 
@@ -1730,7 +1882,6 @@ def staff_menu(username):
                   bg="pink", fg="black", command=lambda: staff_menu(username)).pack(pady=15) 
 
     def manage_schedule():
-        
         sched_win = tk.Toplevel(root)
         sched_win.title("Manage Schedule")
         sched_win.geometry("400x400")
@@ -1787,7 +1938,6 @@ def staff_menu(username):
 
         tk.Button(sched_win, text="Save", bg="pink", font=("Arial", 14, "bold"),
                   command=save_schedule).pack(pady=15)
-        
 
     def view_schedule():
         clear_frame()
@@ -1816,9 +1966,9 @@ def staff_menu(username):
                           font=("Arial", 14), fg="black", bg="white").pack(anchor="w", padx=20, pady=2)
 
         tk.Button(root, text="Back", font=("Arial", 14, "bold"),
-                  bg="pink", fg="black", command=lambda: staff_menu(username)).pack(pady=20) 
+                  bg="pink", fg="black", command=lambda: staff_menu(username)).pack(pady=20)
         
-    tk.Button(root, text="View My Profile", command=lambda: view_staff_profile(username), **btn_style).pack(pady=10)
+    tk.Button(root, text="View My Profile", command=lambda: view_staff_profile(username), **btn_style).pack(pady=10) 
     tk.Button(root, text="View Assigned Reservations", command=view_assigned, **btn_style).pack(pady=10)
     tk.Button(root, text="Update Reservation Status", command=open_update_gui, **btn_style).pack(pady=10)
     tk.Button(root, text="Manage Schedule", command=manage_schedule, **btn_style).pack(pady=10)
@@ -1827,7 +1977,7 @@ def staff_menu(username):
     tk.Button(root, text="Logout", command=main_menu, **btn_style).pack(pady=20)
 
 
-
+# CUSTOMER MENU
 
 def view_customer_profile(username):
     clear_frame()
@@ -1848,7 +1998,7 @@ def view_customer_profile(username):
     }
     
     row = 0
-    
+
     tk.Label(details_frame, text="Username:", font=("Arial", 14, "bold"), bg="white").grid(row=row, column=0, sticky="w", padx=10, pady=2)
     tk.Label(details_frame, text=username, font=("Arial", 14), bg="white").grid(row=row, column=1, sticky="w", pady=2)
     row += 1
@@ -1867,8 +2017,7 @@ def view_customer_profile(username):
 def customer_menu(username):
     clear_frame()
 
-    try:
-        
+    try: 
         bg_image = Image.open(r"C:\Users\nhel\Desktop\Salon Image\page.jpg").resize((800, 600))
         bg_photo = ImageTk.PhotoImage(bg_image)
         bg_label = tk.Label(root, image=bg_photo)
@@ -1907,41 +2056,22 @@ def customer_menu(username):
               width=25, height=1, bd=0).place(relx=0.5, rely=0.88, anchor="center")
 
 
-
 def get_service_duration(service_category, service_name):
     """Parses the duration (which is an integer in your services dict) and returns duration in minutes."""
     try:
+
         duration = services[service_category][service_name]['duration']
+
         if isinstance(duration, int):
             return duration
-        
         return 30
     except Exception:
-        
         return 30
-
-
-def normalize_time(val):
-    """Convert DB time field to datetime.time safely."""
-    if isinstance(val, datetime.timedelta):
-        
-        return (datetime.datetime.min + val).time()
-    elif isinstance(val, str):
-        
-        try:
-            return datetime.datetime.strptime(val, "%H:%M:%S").time()
-        except ValueError:
-            return datetime.datetime.strptime(val, "%H:%M").time()
-    elif isinstance(val, datetime.time):
-        return val
-    else:
-        raise ValueError(f"Unsupported time format: {val}")
 
 
 def is_within_schedule(staff, date, time_obj, service_duration_minutes):
-    
-    if staff not in staff_schedules or not staff_schedules[staff]:
-        return False, f"Staff {staff} has no schedule defined."
+
+    staff_sched = staff_schedules.get(staff, [])
 
     chosen_start_dt = datetime.datetime.combine(date, time_obj)
     chosen_end_dt   = chosen_start_dt + datetime.timedelta(minutes=service_duration_minutes)
@@ -1954,13 +2084,11 @@ def is_within_schedule(staff, date, time_obj, service_duration_minutes):
 
     is_in_schedule = False
 
-    for sched in staff_schedules[staff]:
+    for sched in staff_sched:
         try:
-            
             sched_date = sched["date"]
-            if isinstance(sched_date, datetime.datetime):
-                sched_date = sched_date.date()
-            elif isinstance(sched_date, str):
+
+            if isinstance(sched_date, str):
                 sched_date = datetime.datetime.strptime(sched_date, "%Y-%m-%d").date()
 
             if sched_date != date:
@@ -1985,7 +2113,6 @@ def is_within_schedule(staff, date, time_obj, service_duration_minutes):
     if not is_in_schedule:
         return False, "Requested time is outside staff working hours."
 
-
     for r in reservations:
         if r["staff"] != staff:
             continue
@@ -1998,7 +2125,7 @@ def is_within_schedule(staff, date, time_obj, service_duration_minutes):
             continue
 
         res_time = r["time"]
-        if isinstance(res_time, datetime.timedelta):
+        if isinstance(res_time, datetime.timedelta):  
             res_time = (datetime.datetime.min + res_time).time()
 
         res_start_dt = datetime.datetime.combine(date, res_time)
@@ -2014,7 +2141,6 @@ def view_services(username):
     clear_frame()
 
     try:
-        # 
         bg_image = Image.open(r"C:\Users\nhel\Desktop\Salon Image\pp.jpg").resize((800, 600))
         bg_photo = ImageTk.PhotoImage(bg_image)
         bg_label = tk.Label(root, image=bg_photo)
@@ -2043,7 +2169,7 @@ def view_services(username):
     scrollbar.pack(side="right", fill="y")
 
     for category, items in services.items():
-        tk.Label(scroll_frame, text=f"{category}",
+        tk.Label(scroll_frame, text=f" {category}",
                  font=("Arial Rounded MT Bold", 16),
                  fg="#ff69b4", bg="white").pack(anchor="w", pady=(5, 0))
 
@@ -2052,7 +2178,7 @@ def view_services(username):
                       font=("Arial", 12), fg="black", bg="white").pack(anchor="w", padx=20)
 
     tk.Button(root, text="Back", command=lambda: customer_menu(username),
-              bg="pink", fg="black", font=("Arial", 14, "bold")).pack(pady=10)
+              bg="blue", fg="black", font=("Arial", 14, "bold")).pack(pady=10)
 
 
 def view_staff(username):
@@ -2123,7 +2249,27 @@ def view_staff(username):
 
 
 
+def normalize_time(val):
+    """Convert DB time field to datetime.time safely."""
+    import datetime
+    if isinstance(val, datetime.timedelta):
+        return (datetime.datetime.min + val).time()
+    elif isinstance(val, str):
+        try:
+            return datetime.datetime.strptime(val, "%H:%M:%S").time()
+        except ValueError:
+            return datetime.datetime.strptime(val, "%H:%M").time()
+    elif isinstance(val, datetime.time):
+        return val
+    else:
+        return None
+
+
 def booking_panel(username):
+    import datetime
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+
     clear_frame()
     tk.Label(root, text="BOOKING PANEL (Standard)",
              font=("Arial Rounded MT Bold", 26), fg="pink", bg="white").pack(pady=20)
@@ -2153,32 +2299,12 @@ def booking_panel(username):
     time_box = ttk.Combobox(panel, values=time_options, state="readonly", width=20)
     time_box.grid(row=3, column=1, pady=5)
 
-    def update_staff(event=None):
-        selected_service = service_box.get()
-        if not selected_service:
-            staff_box['values'] = []
-            staff_box.set('')
-            return
+    tk.Label(panel, text="Select Room:", font=("Arial", 14, "bold"), bg="white").grid(row=4, column=0, sticky="w", pady=5)
+    available_rooms = get_available_rooms()
+    room_box = ttk.Combobox(panel, values=available_rooms, state="disabled", width=30)
+    room_box.grid(row=4, column=1, pady=5)
 
-        parts = selected_service.split(" - ")
-        svc_category = parts[0]
-        svc_name_only = parts[1]
-
-        available_staff = []
-        for u, d in users.items():
-            if d.get("role") == "Staff":
-                staff_specialties = d.get("specialty") or ""
-                staff_specialties_list = [s.strip() for s in staff_specialties.split(",")] if staff_specialties else []                
-                
-                if d.get("category") == svc_category or svc_name_only in staff_specialties_list:
-                    available_staff.append(u)
-
-        staff_box['values'] = available_staff
-        staff_box.set('')
-        time_box.set('')  
-        update_available_times()
-
-    service_box.bind("<<ComboboxSelected>>", update_staff)
+    allowed_room_categories = ["Massage & Body Therapy", "Body Treatments & Skin Specialty"]
 
     def update_available_times(event=None):
         selected_staff = staff_box.get()
@@ -2196,7 +2322,7 @@ def booking_panel(username):
                 WHERE staff_name=%s AND date=%s
                   AND status NOT IN ('Cancelled','Completed','No-Show (Cancelled)')
             """, (selected_staff, selected_date))
-            booked_times = [row['time'].strftime("%H:%M") for row in cursor.fetchall()]
+            booked_times = [normalize_time(row['time']).strftime("%H:%M") for row in cursor.fetchall()]
             conn.close()
         except Exception as e:
             booked_times = []
@@ -2205,7 +2331,41 @@ def booking_panel(username):
         available_times = [t for t in time_options if t not in booked_times]
         time_box['values'] = available_times
         time_box.set('')
-    
+
+    def update_staff(event=None):
+        selected_service = service_box.get()
+        if not selected_service:
+            staff_box['values'] = []
+            staff_box.set('')
+            room_box.set('')
+            room_box.config(state="disabled")
+            return
+
+        parts = selected_service.split(" - ")
+        svc_category = parts[0].strip()
+        svc_name_only = parts[1].strip()
+
+        if svc_category in allowed_room_categories:
+            room_box.config(state="readonly")
+        else:
+            room_box.set('')
+            room_box.config(state="disabled")
+
+        available_staff = []
+        for u, d in users.items():
+            if d.get("role") != "Staff":
+                continue
+            staff_specialties = d.get("specialty") or ""
+            staff_specialties_list = [s.strip().lower() for s in staff_specialties.split(",")] if staff_specialties else []
+            category_val = d.get("category") or ""
+            if category_val.strip().lower() == svc_category.lower() or svc_name_only.lower() in staff_specialties_list:
+                available_staff.append(u)
+
+        staff_box['values'] = available_staff
+        staff_box.set('')
+        time_box.set('')
+
+    service_box.bind("<<ComboboxSelected>>", update_staff)
     staff_box.bind("<<ComboboxSelected>>", update_available_times)
     date_box.bind("<<ComboboxSelected>>", update_available_times)
 
@@ -2214,73 +2374,54 @@ def booking_panel(username):
         selected_staff = staff_box.get()
         selected_date_str = date_box.get()
         selected_time_str = time_box.get()
+        selected_room = room_box.get()
 
         if not (selected_service and selected_staff and selected_date_str and selected_time_str):
             messagebox.showerror("Error", "Please complete all fields.")
             return
 
-        try:
-            selected_date = datetime.datetime.strptime(selected_date_str, "%Y-%m-%d").date()
-        except ValueError:
-            messagebox.showerror("Error", "Invalid date format.")
-            return
-
-        try:
-            selected_time = datetime.datetime.strptime(selected_time_str, "%H:%M").time() 
-        except ValueError:
-            messagebox.showerror("Error", "Invalid time format.")
-            return      
-
-        try:
-            conn = create_connection()
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute("""
-                SELECT * FROM reservations
-                WHERE staff_name=%s AND date=%s AND time=%s
-                  AND status NOT IN ('Cancelled','Completed','No-Show (Cancelled)')
-            """, (selected_staff, selected_date, selected_time))
-            conflict = cursor.fetchone()
-            if conflict:
-                conn.close()
-                messagebox.showerror("Error", "Staff is already booked at that time.")
-                return
-        except Exception as e:
-            messagebox.showerror("Error", f"Conflict check failed: {e}")
-            return
-
         parts = selected_service.split(" - ")
-        svc_category = parts[0]
-        svc_name_only = parts[1]
+        svc_category = parts[0].strip()
+        svc_name_only = parts[1].strip()
+
+        selected_date = datetime.datetime.strptime(selected_date_str, "%Y-%m-%d").date()
+        selected_time = datetime.datetime.strptime(selected_time_str, "%H:%M").time()
         service_duration_minutes = services.get(svc_category, {}).get(svc_name_only, {}).get("duration", 60)
 
-        is_available, reason = is_within_schedule(selected_staff, selected_date, selected_time, service_duration_minutes) 
-        if not is_available:   
-            status = "Pending - Staff Unavailable"
-            messagebox.showwarning("Warning", reason)
-        else:
-            status = "Pending"
+        break_start = datetime.datetime.combine(selected_date, datetime.time(12, 0))
+        break_end = datetime.datetime.combine(selected_date, datetime.time(13, 0))
+        chosen_start = datetime.datetime.combine(selected_date, selected_time)
+        chosen_end = chosen_start + datetime.timedelta(minutes=service_duration_minutes)
+        if chosen_start < break_end and chosen_end > break_start:
+            messagebox.showerror("Error", "Booking overlaps with staff break time (12:00 PM - 1:00 PM).")
+            return
 
-        try:
-            conn = create_connection()
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO reservations (customer_name, staff_name, service_name, date, time, duration_minutes, status)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """, (
-                username,
-                selected_staff,
-                selected_service,
-                selected_date,
-                selected_time,
-                service_duration_minutes,
-                status
-            ))
-            conn.commit()
-            conn.close()
-            messagebox.showinfo("Success", f"Booking confirmed for {selected_staff} on {selected_date} at {selected_time}. Status: {status}")
+        if svc_category in allowed_room_categories:
+            if not selected_room:
+                messagebox.showerror("Error", "This service requires a room. Please select one.")
+                return
+            room_arg = selected_room
+        else:
+            room_arg = None 
+
+        success = insert_reservation_to_db(
+            customer=username,
+            staff=selected_staff,
+            service=svc_name_only,
+            date=selected_date,
+            time_obj=selected_time,
+            duration=service_duration_minutes,
+            room_name=room_arg
+        )
+
+        if success:
+            if room_arg:
+                messagebox.showinfo("Success", f"Booking confirmed! Room {room_arg} will be used.")
+            else:
+                messagebox.showinfo("Success", "Booking confirmed! No room required for this service.")
             customer_menu(username)
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to save booking: {e}")
+        else:
+            messagebox.showerror("Error", "Failed to save booking.")
 
     tk.Button(root, text="Confirm Booking", font=("Arial", 14, "bold"), bg="pink", fg="black",
               command=confirm_booking).pack(pady=20)
@@ -2288,28 +2429,34 @@ def booking_panel(username):
               bg="gray", fg="white", command=lambda: customer_menu(username)).pack(pady=5)
 
 
-def complete_booking(staff, reservation):
-    res_id = reservation["id"]
-    res_date = reservation["date"]
-
-    if not any(s["date"] == res_date for s in staff_schedules.get(staff, [])):
-        messagebox.showerror("Error", f"You have no schedule on {res_date}. You cannot complete this booking.")
-        return
-
-    try:
-        conn = create_connection()
-        cursor = conn.cursor()
-        cursor.execute("UPDATE reservations SET status='Completed' WHERE id=%s", (res_id,))
-        conn.commit()
-        conn.close()
-        messagebox.showinfo("Success", "Booking marked as completed!")
-    except Exception as e:
-        messagebox.showerror("Error", f"Failed to update booking: {e}")
-
-
-    
 def reserve_service(username):
     clear_frame()
+
+    def reload_services_from_db():
+        global services
+        services = {}
+        try:
+            conn = create_connection()
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute("SELECT staff_id, category, service_name, price, duration_minutes, description FROM staff_specialties")
+            rows = cursor.fetchall()
+            conn.close()
+
+            for row in rows:
+                cat = row["category"]
+                svc = row["service_name"]
+                if cat not in services:
+                    services[cat] = {}
+                services[cat][svc] = {
+                    "price": row["price"],
+                    "duration": row["duration_minutes"],
+                    "description": row["description"]
+                }
+        except Exception as e:
+            print("Error loading services:", e)
+
+    reload_services_from_db()
+
     tk.Label(root, text="RESERVE A SERVICE (WITH PAYMENT)",
              font=("Arial Rounded MT Bold", 26), fg="pink", bg="white").pack(pady=20)
 
@@ -2330,8 +2477,7 @@ def reserve_service(username):
             print("Error fetching services:", e)
             return []
 
-    service_names = get_all_services()
-    service_box = ttk.Combobox(panel, values=service_names, state="readonly", width=50)
+    service_box = ttk.Combobox(panel, values=get_all_services(), state="readonly", width=50)
     service_box.grid(row=0, column=1, pady=5)
 
     tk.Label(panel, text="Price:", font=("Arial", 14, "bold"), bg="white").grid(row=0, column=2, sticky="w", padx=10)
@@ -2341,6 +2487,10 @@ def reserve_service(username):
     tk.Label(panel, text="Select Staff:", font=("Arial", 14, "bold"), bg="white").grid(row=1, column=0, sticky="w", pady=5)
     staff_box = ttk.Combobox(panel, values=[], state="readonly", width=40)
     staff_box.grid(row=1, column=1, pady=5)
+
+    tk.Label(panel, text="Select Room:", font=("Arial", 14, "bold"), bg="white").grid(row=1, column=2, sticky="w", padx=10)
+    room_box = ttk.Combobox(panel, values=[], state="readonly", width=20)
+    room_box.grid(row=1, column=3, pady=5)
 
     tk.Label(panel, text="Select Date:", font=("Arial", 14, "bold"), bg="white").grid(row=2, column=0, sticky="w", pady=5)
     today = datetime.date.today()
@@ -2353,12 +2503,32 @@ def reserve_service(username):
     time_box = ttk.Combobox(panel, values=time_options, state="readonly", width=20)
     time_box.grid(row=3, column=1, pady=5)
 
-    def update_staff_and_price(event):
+    def load_available_rooms(selected_date):
+        try:
+            conn = create_connection()
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute("SELECT room_name FROM rooms WHERE status='available'")
+            all_rooms = [r['room_name'] for r in cursor.fetchall()]
+            conn.close()
+            room_box['values'] = all_rooms
+            if all_rooms:
+                room_box.current(0)
+            else:
+                room_box.set('None')
+        except Exception as e:
+            print("Error loading rooms:", e)
+            room_box['values'] = ["None"]
+            room_box.set('None')
+
+    def update_staff_and_price(event=None):
         selected_service = service_box.get()
         if not selected_service:
             staff_box['values'] = []
             staff_box.set('')
             price_label.config(text="₱0")
+            room_box['values'] = ["None"]
+            room_box.set("None")
+            room_box['state'] = 'disabled'
             return
 
         parts = selected_service.split(" - ")
@@ -2373,60 +2543,144 @@ def reserve_service(username):
         if staff_ids:
             staff_box.current(0)
 
+        if svc_category in ["Massage & Body Therapy", "Body Treatments & Skin Specialty"]:
+            room_box['state'] = 'readonly'
+            if date_box.get():
+                load_available_rooms(date_box.get())
+        else:
+            room_box['values'] = ["None"]
+            room_box.set("None")
+            room_box['state'] = 'disabled'
+
     service_box.bind("<<ComboboxSelected>>", update_staff_and_price)
+    date_box.bind("<<ComboboxSelected>>", lambda e: update_staff_and_price())
+    time_box.bind("<<ComboboxSelected>>", lambda e: update_staff_and_price())
+
+    def is_within_schedule(staff, date, time_obj, duration_minutes):
+        try:
+            conn = create_connection()
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute("SELECT * FROM staff_schedules WHERE staff_name=%s AND work_date=%s", (staff, date))
+            scheds = cursor.fetchall()
+            conn.close()
+
+            chosen_start = datetime.datetime.combine(date, time_obj)
+            chosen_end = chosen_start + datetime.timedelta(minutes=duration_minutes)
+
+            if not scheds:
+                return False, "Staff has no schedule on this day."
+
+            for sched in scheds:
+                sched_start = sched["start_time"]
+                sched_end = sched["end_time"]
+
+                if isinstance(sched_start, datetime.timedelta):
+                    sched_start = (datetime.datetime.min + sched_start).time()
+                if isinstance(sched_end, datetime.timedelta):
+                    sched_end = (datetime.datetime.min + sched_end).time()
+
+                sched_start_dt = datetime.datetime.combine(date, sched_start)
+                sched_end_dt = datetime.datetime.combine(date, sched_end)
+
+                if chosen_start >= sched_start_dt and chosen_end <= sched_end_dt:
+                    return True, "Staff is available."
+
+            return False, "Requested time is outside staff working hours."
+
+        except Exception as e:
+            print("Schedule parse error:", e)
+            return False, "Error checking staff schedule."
+
+    def check_customer_conflict(customer_name, date, time_obj, duration_minutes):
+        try:
+            conn = create_connection()
+            cursor = conn.cursor(dictionary=True)
+            res_start = datetime.datetime.combine(date, time_obj)
+            res_end = res_start + datetime.timedelta(minutes=duration_minutes)
+            cursor.execute("""
+                SELECT date, time, duration_minutes
+                FROM reservations
+                WHERE customer_name=%s
+                  AND status NOT IN ('Cancelled','Completed','No-Show (Cancelled)')
+                  AND date=%s
+            """, (customer_name, date.strftime("%Y-%m-%d")))
+            reservations = cursor.fetchall()
+            conn.close()
+            for r in reservations:
+                res_time = r["time"]
+                if isinstance(res_time, datetime.timedelta):
+                    res_time = (datetime.datetime.min + res_time).time()
+                existing_start = datetime.datetime.combine(r["date"], res_time)
+                existing_end = existing_start + datetime.timedelta(minutes=r["duration_minutes"])
+                if (res_start < existing_end) and (res_end > existing_start):
+                    return True
+            return False
+        except Exception as e:
+            print("Customer Conflict Check Error:", e)
+            return True
 
     def confirm_reservation_inner():
         selected_service = service_box.get()
         selected_staff = staff_box.get()
+        selected_room = room_box.get()
         selected_date_str = date_box.get()
         selected_time_str = time_box.get()
 
         if not (selected_service and selected_staff and selected_date_str and selected_time_str):
-            messagebox.showerror("Error", "Please complete all fields.")
-            return
-
-        try:
-            selected_date = datetime.datetime.strptime(selected_date_str, "%Y-%m-%d").date()
-        except ValueError:
-            messagebox.showerror("Error", "Invalid date format.")
-            return
-
-        try:
-            selected_time = datetime.datetime.strptime(selected_time_str, "%H:%M").time()
-        except ValueError:
-            messagebox.showerror("Error", "Invalid time format.")
+            messagebox.showerror("Error", "Please complete all required fields.")
             return
 
         parts = selected_service.split(" - ")
         svc_category = parts[0]
         svc_name_only = parts[1]
-
         service_duration_minutes = services.get(svc_category, {}).get(svc_name_only, {}).get("duration", 60)
 
-        is_available, reason = is_within_schedule(selected_staff, selected_date, selected_time, service_duration_minutes)
-        if not is_available:
-            messagebox.showerror("Error", reason)
+        try:
+            selected_date = datetime.datetime.strptime(selected_date_str, "%Y-%m-%d").date()
+            selected_time = datetime.datetime.strptime(selected_time_str, "%H:%M").time()
+        except ValueError:
+            messagebox.showerror("Error", "Invalid date or time format.")
             return
 
+        break_start = datetime.time(12, 0)
+        break_end = datetime.time(13, 0)
+        if break_start <= selected_time < break_end:
+            messagebox.showerror("Break Time", "Reservations between 12:00 PM and 1:00 PM are not allowed.")
+            return
+
+        if svc_category in ["Massage & Body Therapy", "Body Treatments & Skin Specialty"] and selected_room == "None":
+            messagebox.showerror("Error", "Please select a room for this service!")
+            return
+        if selected_room == "None":
+            selected_room = None
+
+        schedule_ok, msg = is_within_schedule(selected_staff, selected_date, selected_time, service_duration_minutes)
+        if not schedule_ok:
+            messagebox.showerror("Staff Unavailable", msg)
+            return
+
+        if check_customer_conflict(username, selected_date, selected_time, service_duration_minutes):
+            messagebox.showerror("Conflict", "You already have a reservation during this time.")
+            return
 
         success = insert_reservation_to_db(
             customer=username,
             staff=selected_staff,
-            service=svc_name_only,  
+            service=svc_name_only,
             date=selected_date,
-            time=selected_time,
-            duration=service_duration_minutes
+            time_obj=selected_time,
+            duration=service_duration_minutes,
+            room_name=selected_room
         )
 
         if success:
-            messagebox.showinfo("Success", "Reservation confirmed and saved!")
-            pay_for_service(username, selected_service)
+            messagebox.showinfo("Success", "Reservation confirmed!")
         else:
-            messagebox.showerror("Error", "Failed to save reservation to database.")
+            messagebox.showerror("Error", "Failed to save reservation. Check conflicts.")
 
-    tk.Button(root, text="Confirm Reservation", font=("Arial", 14, "bold"), bg="pink", fg="black",
+    tk.Button(root, text="Confirm Reservation", font=("Arial", 14, "bold"), bg="blue", fg="black",
               command=confirm_reservation_inner).pack(pady=20)
-    tk.Button(root, text="Back", font=("Arial", 14, "bold"), bg="gray", fg="white",
+    tk.Button(root, text="Back", font=("Arial", 14, "bold"), bg="blue", fg="white",
               command=lambda: customer_menu(username)).pack(pady=5)
 
 
@@ -2451,7 +2705,7 @@ def pay_for_service(username, selected_service):
     amount_entry = tk.Entry(pay_window, font=("Arial", 12))
     amount_entry.pack(pady=5)
     amount_entry.insert(0, f"{price:.2f}")
-    amount_entry.config(state="readonly") 
+    amount_entry.config(state="readonly")  
 
     def confirm_payment():
         global customer_balance
@@ -2465,6 +2719,12 @@ def pay_for_service(username, selected_service):
 
 
 def cancel_reservation_object(username, reservation):
+
+    current_status = reservation.get("status")
+    if current_status in ["On-Going", "Completed"]:
+        messagebox.showerror("Error", f"You cannot cancel a reservation that is already {current_status}.")
+        return
+
     confirm = messagebox.askyesno(
         "Confirm",
         f"Cancel reservation for {reservation['service_name']} on {reservation['date']}?"
@@ -2472,18 +2732,25 @@ def cancel_reservation_object(username, reservation):
     
     if confirm:
         try:
-            
             conn = create_connection()
             cursor = conn.cursor()
+
             cursor.execute("""
                 UPDATE reservations
                 SET status = 'Cancelled'
                 WHERE id = %s
             """, (reservation['id'],))
+
+            cursor.execute("SELECT room_name FROM reservation_rooms WHERE reservation_id = %s", (reservation['id'],))
+            room = cursor.fetchone()
+            if room:
+                room_name = room[0]  
+                cursor.execute("UPDATE rooms SET status='available' WHERE room_name=%s", (room_name,))
+
             conn.commit()
             conn.close()
 
-            messagebox.showinfo("Cancelled", "Your reservation has been cancelled.")
+            messagebox.showinfo("Cancelled", "Your reservation has been cancelled and the room is now available.")
             view_reservations_customer(username)
         except Exception as e:
             messagebox.showerror("Error", f"Could not cancel reservation: {e}")
@@ -2506,7 +2773,7 @@ def reschedule_reservation(username, selected_res):
     today = dt.date.today()
     date_options = [(today + dt.timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
     date_box = ttk.Combobox(res_win, values=date_options, font=("Arial", 12), width=30, state="readonly")
-    date_box.set(selected_res["date"])
+    date_box.set(str(selected_res["date"]))
     date_box.pack(pady=5)
 
     tk.Label(res_win, text="Select New Time:", font=("Arial", 14, "bold"), bg="white").pack(pady=5)
@@ -2523,9 +2790,12 @@ def reschedule_reservation(username, selected_res):
     time_box = ttk.Combobox(res_win, values=time_options, font=("Arial", 12), width=30, state="readonly")
     
     try:
-        current_time_str_24hr = selected_res.get("time").split()[0]
-        current_time_str = dt.datetime.strptime(current_time_str_24hr, "%H:%M").strftime("%I:%M %p").lstrip('0')
-    except (ValueError, TypeError, AttributeError):
+        current_time_val = normalize_time(selected_res.get("time"))
+        if current_time_val:
+            current_time_str = current_time_val.strftime("%I:%M %p").lstrip('0')
+        else:
+            current_time_str = "10:00 AM"
+    except Exception:
         current_time_str = "10:00 AM"
     
     time_box.set(current_time_str)
@@ -2547,7 +2817,7 @@ def reschedule_reservation(username, selected_res):
 
         try:
             time_obj = dt.datetime.strptime(new_time_12hr, "%I:%M %p")
-            new_time_24hr = time_obj.strftime("%H:%M:%S")  
+            new_time_24hr = time_obj.strftime("%H:%M:%S")   
         except ValueError:  
             messagebox.showerror("Error", "Invalid time format.")
             return      
@@ -2563,16 +2833,12 @@ def reschedule_reservation(username, selected_res):
             cursor = conn.cursor(dictionary=True)
             cursor.execute("""
                SELECT * FROM reservations
-               WHERE staff_name = %s AND date = %s  
-                 AND TIME_TO_SEC(time) <= TIME_TO_SEC(%s) + (%s * 60)
-                 AND TIME_TO_SEC(time) + (duration_minutes * 60) >= TIME_TO_SEC(%s)
+               WHERE staff_name = %s AND date = %s AND time = %s
                  AND status NOT IN ('Cancelled','Completed','No-Show (Cancelled)')
                  AND id <> %s      
            """, (
                 selected_res['staff_name'],
                 str(new_date_obj),
-                new_time_24hr,
-                service_duration_minutes,
                 new_time_24hr,
                 selected_res['id']
            ))
@@ -2627,6 +2893,7 @@ def reschedule_reservation(username, selected_res):
               command=confirm_reschedule).pack(pady=10)
     tk.Button(res_win, text="Cancel", bg="gray", fg="white", font=("Arial", 12, "bold"),
               command=res_win.destroy).pack()
+
     
 
 def view_reservations_customer(username):
@@ -2874,10 +3141,12 @@ def view_reservations_customer(username):
               command=lambda: customer_menu(username)).pack(pady=20)
 
 
-# -------------------------------
-# START APP
-# -------------------------------
 main_menu()
 root.mainloop()
+
+
+
+
+
 
 

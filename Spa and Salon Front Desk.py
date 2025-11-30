@@ -3143,10 +3143,3 @@ def view_reservations_customer(username):
 
 main_menu()
 root.mainloop()
-
-
-
-
-
-
-
